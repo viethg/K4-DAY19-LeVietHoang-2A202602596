@@ -18,6 +18,8 @@ from dataclasses import dataclass, fields
 from typing import Any
 
 PROVIDERS = {
+    "deepseek": {"key": "DEEPSEEK_API_KEY", "base_url": "https://api.deepseek.com",
+                 "chat": "deepseek-flash", "embed": None},
     "openai": {"key": "OPENAI_API_KEY", "base_url": None,
                "chat": "gpt-4o-mini", "embed": "text-embedding-3-small"},
     "openrouter": {"key": "OPENROUTER_API_KEY", "base_url": "https://openrouter.ai/api/v1",
@@ -26,11 +28,16 @@ PROVIDERS = {
                "chat": "gemini-2.5-flash-lite", "embed": "gemini-embedding-001"},
     "anthropic": {"key": "ANTHROPIC_API_KEY", "base_url": None,
                   "chat": "claude-opus-5-5", "embed": None},
+    "mock": {"key": None, "base_url": None,
+             "chat": None, "embed": "mock-64d"},
 }
-PROVIDER_ORDER = ["openai", "openrouter", "gemini", "anthropic"]
+PROVIDER_ORDER = ["deepseek", "openai", "openrouter", "gemini", "anthropic", "mock"]
 
 # USD per 1M tokens (input, output). Check each provider's pricing page before reporting real numbers.
 PRICES_PER_M = {
+    "deepseek-flash": (0.14, 0.28),
+    "deepseek-chat": (0.14, 0.28),
+    "deepseek-v4-pro": (0.50, 2.00),
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4.1-mini": (0.40, 1.60),
     "gpt-4.1-nano": (0.10, 0.40),
@@ -41,6 +48,7 @@ PRICES_PER_M = {
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
     "claude-haiku-4-5": (1.00, 5.00),
+    "mock-64d": (0.0, 0.0),
 }
 
 @dataclass
@@ -68,13 +76,15 @@ def pick_provider(env_var: str, need_embeddings: bool) -> str:
     if chosen:
         if chosen not in usable:
             raise RuntimeError(f"{env_var}={chosen} không hợp lệ; chọn một trong: {', '.join(usable)}")
-        if not os.getenv(PROVIDERS[chosen]["key"]):
-            raise RuntimeError(f"{env_var}={chosen} nhưng chưa có {PROVIDERS[chosen]['key']} trong .env")
+        key_var = PROVIDERS[chosen]["key"]
+        if key_var and not os.getenv(key_var):
+            raise RuntimeError(f"{env_var}={chosen} nhưng chưa có {key_var} trong .env")
         return chosen
     for provider in usable:
-        if os.getenv(PROVIDERS[provider]["key"]):
+        key_var = PROVIDERS[provider]["key"]
+        if key_var is None or os.getenv(key_var):
             return provider
-    keys = " / ".join(PROVIDERS[p]["key"] for p in usable)
+    keys = " / ".join(PROVIDERS[p]["key"] for p in usable if PROVIDERS[p]["key"])
     raise RuntimeError(f"Chưa có API key nào cho {'embedding' if need_embeddings else 'chat'}: cần một trong {keys}")
 
 def _strip_fences(text: str) -> str:
@@ -111,33 +121,43 @@ class MeteredLLM:
             self._chat_client = anthropic.Anthropic(api_key=os.environ[PROVIDERS["anthropic"]["key"]])
         else:
             self._chat_client = _openai_client(self.chat_provider)
-        self._embed_client = (self._chat_client if self.embed_provider == self.chat_provider
-                              else _openai_client(self.embed_provider))
+        if self.embed_provider == "mock":
+            self._embed_client = None
+        else:
+            self._embed_client = (self._chat_client if self.embed_provider == self.chat_provider
+                                  else _openai_client(self.embed_provider))
 
     def chat(self, prompt: str, json_mode: bool = False) -> str:
-        start = time.perf_counter()
-        if self.chat_provider == "anthropic":
-            text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
-        else:
-            if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    response_format={"type": "json_object"},
-                )
+        result = ""
+        for attempt in range(3):
+            start = time.perf_counter()
+            if self.chat_provider == "anthropic":
+                text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
             else:
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                )
-            text, model = response.choices[0].message.content or "", self.chat_model_id
-            usage = response.usage
-            tokens_in = usage.prompt_tokens if usage else 0
-            tokens_out = usage.completion_tokens if usage else 0
-        self.usage += Usage(1, tokens_in, tokens_out, price(model, tokens_in, tokens_out), time.perf_counter() - start)
-        return _strip_fences(text) if json_mode else text
+                if json_mode and self.chat_provider != "gemini":
+                    response = self._chat_client.chat.completions.create(
+                        model=self.chat_model_id,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0,
+                        response_format={"type": "json_object"},
+                    )
+                else:
+                    response = self._chat_client.chat.completions.create(
+                        model=self.chat_model_id,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0,
+                    )
+                text, model = response.choices[0].message.content or "", self.chat_model_id
+                usage = response.usage
+                tokens_in = usage.prompt_tokens if usage else 0
+                tokens_out = usage.completion_tokens if usage else 0
+            self.usage += Usage(1, tokens_in, tokens_out, price(model, tokens_in, tokens_out), time.perf_counter() - start)
+            result = _strip_fences(text) if json_mode else text
+            if json_mode and not result.strip() and attempt < 2:
+                time.sleep(1)
+                continue
+            return result or ("{}" if json_mode else "")
+        return result or ("{}" if json_mode else "")
 
     def _chat_anthropic(self, prompt: str) -> tuple[str, str, int, int]:
         # Claude Opus 5.5: thinking is always on and sampling params are removed; effort is the cost lever.
@@ -158,6 +178,11 @@ class MeteredLLM:
 
     def embed(self, text: str) -> list[float]:
         start = time.perf_counter()
+        if self.embed_provider == "mock":
+            from .embeddings import _mock_embed
+            vec = _mock_embed(text)
+            self.usage += Usage(1, 0, 0, 0.0, time.perf_counter() - start)
+            return vec
         response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
         tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
         self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
